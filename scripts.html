@@ -1,0 +1,362 @@
+<script>
+const MAX_SIZE = 1024 * 1024;
+
+      // ตั้งเป้า 950 KB
+      // เพื่อไม่ให้ชนขอบ 1 MB
+      const TARGET_SIZE = 950 * 1024;
+
+      let finalBlob = null;
+      let finalUrl = null;
+      let finalFileName = null;
+      let isProcessing = false;
+
+      // ==========================================
+      // เลือกรูป
+      // ==========================================
+
+      document
+        .getElementById("fileInput")
+        .addEventListener("change", async function (event) {
+          const file = event.target.files[0];
+
+          if (!file) {
+            return;
+          }
+
+          if (isProcessing) {
+            return;
+          }
+
+          hideError();
+          isProcessing = true;
+
+          document.getElementById("result").style.display = "none";
+          document.getElementById("loading").style.display = "block";
+
+          try {
+            await processImage(file);
+          } catch (error) {
+            console.error(error);
+            showError(error.message);
+          } finally {
+            isProcessing = false;
+            document.getElementById("loading").style.display = "none";
+          }
+        });
+
+      // ==========================================
+      // Process
+      // ==========================================
+
+      async function processImage(file) {
+        if (file.type && !file.type.startsWith("image/")) {
+          throw new Error("กรุณาเลือกไฟล์รูปภาพ");
+        }
+
+        const image = await loadImage(file);
+
+        const originalWidth = image.naturalWidth;
+        const originalHeight = image.naturalHeight;
+
+        document.getElementById("originalSize").textContent = formatBytes(
+          file.size,
+        );
+
+        document.getElementById("originalResolution").textContent =
+          originalWidth + " × " + originalHeight;
+
+        const result = await compressImage(
+          image,
+          originalWidth,
+          originalHeight,
+        );
+
+        if (result.blob.size > MAX_SIZE) {
+          throw new Error("ไม่สามารถลดรูปให้ต่ำกว่า 1 MB ได้");
+        }
+
+        finalBlob = result.blob;
+
+        // ล้าง URL เก่า
+        if (finalUrl) {
+          URL.revokeObjectURL(finalUrl);
+        }
+
+        finalUrl = URL.createObjectURL(finalBlob);
+
+        document.getElementById("preview").src = finalUrl;
+
+        document.getElementById("newSize").textContent =
+          formatBytes(finalBlob.size);
+
+        document.getElementById("newResolution").textContent =
+          result.width + " × " + result.height;
+
+        let percent = 100 - (finalBlob.size / file.size) * 100;
+
+        if (percent < 0) {
+          percent = 0;
+        }
+
+        document.getElementById("percent").textContent =
+          percent.toFixed(1) + "%";
+
+        finalFileName = createFileName();
+
+        document.getElementById("result").style.display = "block";
+      }
+
+      // ==========================================
+      // โหลดรูป
+      // ==========================================
+
+      function loadImage(file) {
+        return new Promise((resolve, reject) => {
+          const image = new Image();
+
+          const url = URL.createObjectURL(file);
+
+          image.onload = function () {
+            URL.revokeObjectURL(url);
+
+            resolve(image);
+          };
+
+          image.onerror = function () {
+            URL.revokeObjectURL(url);
+
+            reject(new Error("ไม่สามารถเปิดรูปภาพได้"));
+          };
+
+          image.src = url;
+        });
+      }
+
+      // ==========================================
+      // ลดขนาดรูป
+      // ==========================================
+
+      async function compressImage(image, originalWidth, originalHeight) {
+        let width = originalWidth;
+        let height = originalHeight;
+
+        /*
+         * มือถือปัจจุบันมักถ่ายรูป
+         * 3000-8000 pixels
+         *
+         * เริ่มต้นจำกัดด้านยาวที่ 2560
+         */
+        const MAX_DIMENSION = 2560;
+
+        if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+          const scale = Math.min(MAX_DIMENSION / width, MAX_DIMENSION / height);
+
+          width = Math.round(width * scale);
+
+          height = Math.round(height * scale);
+        }
+
+        /*
+         * Strategy
+         *
+         * 1. ลด Quality ก่อน
+         * 2. ถ้ายังเกิน → ลด Resolution
+         * 3. ทำซ้ำจน <= 950 KB
+         */
+
+        for (let resizeRound = 0; resizeRound < 10; resizeRound++) {
+          const canvas = document.createElement("canvas");
+
+          canvas.width = width;
+          canvas.height = height;
+
+          const ctx = canvas.getContext("2d");
+
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+
+          /*
+           * JPEG ไม่มี transparency
+           * จึงใส่พื้นหลังขาว
+           */
+          ctx.fillStyle = "#FFFFFF";
+
+          ctx.fillRect(0, 0, width, height);
+
+          ctx.drawImage(image, 0, 0, width, height);
+
+          /*
+           * เริ่มจากคุณภาพสูง 95%
+           */
+          for (let quality = 0.95; quality >= 0.4; quality -= 0.05) {
+            const blob = await canvasToBlob(canvas, "image/jpeg", quality);
+
+            if (blob.size <= TARGET_SIZE) {
+              return {
+                blob: blob,
+                width: width,
+                height: height,
+                quality: quality,
+              };
+            }
+          }
+
+          /*
+           * Quality ต่ำแล้วแต่ยังเกิน
+           * ลด Resolution ลงอีก 15%
+           */
+
+          width = Math.round(width * 0.85);
+
+          height = Math.round(height * 0.85);
+
+          if (width < 500 || height < 500) {
+            break;
+          }
+        }
+
+        throw new Error(
+          "รูปภาพนี้มีขนาดใหญ่เกินไปและไม่สามารถลดให้ต่ำกว่า 1 MB ได้",
+        );
+      }
+
+      // ==========================================
+      // Canvas → JPEG Blob
+      // ==========================================
+
+      function canvasToBlob(canvas, mimeType, quality) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob(
+            function (blob) {
+              if (blob) {
+                resolve(blob);
+              } else {
+                reject(new Error("ไม่สามารถสร้างไฟล์รูปภาพได้"));
+              }
+            },
+            mimeType,
+            quality,
+          );
+        });
+      }
+
+      // ==========================================
+      // Download
+      // ==========================================
+
+      function downloadImage() {
+        if (!finalBlob) {
+          return;
+        }
+
+        const downloadUrl = URL.createObjectURL(finalBlob);
+        const imageFile = new File([finalBlob], finalFileName, {
+          type: "image/jpeg",
+        });
+
+        // โทรศัพท์ที่รองรับจะเปิดเมนูบันทึกหรือแชร์ของระบบ
+        if (navigator.canShare && navigator.canShare({ files: [imageFile] })) {
+          navigator
+            .share({ files: [imageFile], title: "รูปภาพที่ลดขนาดแล้ว" })
+            .catch((error) => {
+              if (error.name !== "AbortError") {
+                downloadFromUrl(downloadUrl);
+              }
+            })
+            .finally(() => {
+              setTimeout(() => URL.revokeObjectURL(downloadUrl), 1500);
+            });
+          return;
+        }
+
+        downloadFromUrl(downloadUrl);
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 1500);
+      }
+
+      function downloadFromUrl(url) {
+        const link = document.createElement("a");
+
+        link.href = url;
+
+        link.download = finalFileName;
+
+        document.body.appendChild(link);
+
+        link.click();
+
+        document.body.removeChild(link);
+
+      }
+
+      // ==========================================
+      // ตั้งชื่อไฟล์
+      // ==========================================
+
+      function createFileName() {
+        const date = new Date();
+
+        const yyyy = date.getFullYear();
+
+        const mm = String(date.getMonth() + 1).padStart(2, "0");
+
+        const dd = String(date.getDate()).padStart(2, "0");
+
+        const hh = String(date.getHours()).padStart(2, "0");
+
+        const mi = String(date.getMinutes()).padStart(2, "0");
+
+        const ss = String(date.getSeconds()).padStart(2, "0");
+
+        return "IMG_" + yyyy + mm + dd + "_" + hh + mi + ss + ".jpg";
+      }
+
+      // ==========================================
+      // Reset
+      // ==========================================
+
+      function resetApp() {
+        document.getElementById("fileInput").value = "";
+
+        document.getElementById("result").style.display = "none";
+
+        finalBlob = null;
+
+        if (finalUrl) {
+          URL.revokeObjectURL(finalUrl);
+
+          finalUrl = null;
+        }
+
+        hideError();
+      }
+
+      // ==========================================
+      // แสดงขนาดไฟล์
+      // ==========================================
+
+      function formatBytes(bytes) {
+        const mb = bytes / 1024 / 1024;
+
+        if (mb >= 1) {
+          return mb.toFixed(2) + " MB";
+        }
+
+        return (bytes / 1024).toFixed(0) + " KB";
+      }
+
+      // ==========================================
+      // Error
+      // ==========================================
+
+      function showError(message) {
+        const box = document.getElementById("errorBox");
+
+        box.textContent = message;
+
+        box.style.display = "block";
+      }
+
+      function hideError() {
+        document.getElementById("errorBox").style.display = "none";
+      }
+</script>
